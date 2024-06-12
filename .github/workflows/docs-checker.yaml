@@ -1,0 +1,77 @@
+name: spellcheck & link checker
+
+on:
+  push:
+    paths:
+      - 'README.md'
+      - 'docs/**'
+      - '.github/workflows/docs-checker.yaml'
+  schedule:
+    - cron: '20 8,17 * * *'
+  workflow_dispatch:
+
+jobs:
+  spellcheck:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install pyspelling
+
+      - name: Install Aspell
+        run: |
+          sudo apt-get install aspell aspell-en
+
+      - name: Spellcheck Markdown files
+        run: |
+          pyspelling -c .github/.pyspelling.yaml
+
+  check-README-links:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install markdown-link-check
+        run: npm install -g markdown-link-check
+
+      - name: Check links in README.md
+        run: markdown-link-check README.md
+
+  check-docs-links:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linkchecker
+
+      - name: Check links
+        id: linkcheck
+        run: linkchecker https://docs.lavague.ai/en/latest/
+
+  check-bullet-points-format:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Run markdown formatting check
+        run: |
+          chmod +x .github/bullet-points.sh
+          .github/bullet-points.sh
