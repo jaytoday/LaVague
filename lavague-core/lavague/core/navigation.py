@@ -5,7 +5,7 @@ from typing import Any, List, Tuple, Optional
 from string import Template
 from lavague.core.action_template import ActionTemplate
 from lavague.core.context import Context, get_default_context
-from lavague.core.extractors import BaseExtractor, PythonFromMarkdownExtractor
+from lavague.core.extractors import BaseExtractor, JsonFromMarkdownExtractor
 from lavague.core.retrievers import BaseHtmlRetriever, OpsmSplitRetriever
 from lavague.core.utilities.format_utils import extract_and_eval
 from lavague.core.utilities.web_utils import (
@@ -33,7 +33,7 @@ Query: {query_str}
 Completion:
 
 """,
-    PythonFromMarkdownExtractor(),
+    JsonFromMarkdownExtractor(),
 )
 
 REPHRASE_PROMPT = Template(
@@ -70,6 +70,28 @@ logging_print.addHandler(ch)
 logging_print.propagate = False
 
 
+class Rephraser:
+    def __init__(self, llm: BaseLLM = None, prompt: PromptTemplate = REPHRASE_PROMPT):
+        self.llm = llm
+        self.prompt = prompt
+        if self.llm is None:
+            self.llm = get_default_context().llm
+
+    def rephrase_query(self, query: str) -> List[dict]:
+        """
+        Rephrase the query
+        Args:
+            query (`str`): The query to rephrase
+        Return:
+            `List[dict]`: The rephrased query as a list of dictionaries
+        """
+        rephrase_prompt = self.prompt.safe_substitute(instruction=query)
+        response = self.llm.complete(rephrase_prompt).text
+        response = response.strip("```json\n").strip("\n``` \n")
+        rephrased_query = extract_and_eval(response)
+        return rephrased_query
+
+
 class NavigationEngine(BaseEngine):
     """
     NavigationEngine leverages the llm model and the embedding model to output code from the prompt and the html page.
@@ -98,7 +120,8 @@ class NavigationEngine(BaseEngine):
         driver: BaseDriver,
         llm: BaseLLM = None,
         embedding: BaseEmbedding = None,
-        retriever: BaseHtmlRetriever = OpsmSplitRetriever(),
+        rephraser: Rephraser = None,
+        retriever: BaseHtmlRetriever = None,
         prompt_template: PromptTemplate = NAVIGATION_ENGINE_PROMPT_TEMPLATE.prompt_template,
         extractor: BaseExtractor = NAVIGATION_ENGINE_PROMPT_TEMPLATE.extractor,
         time_between_actions: float = 1.5,
@@ -110,9 +133,14 @@ class NavigationEngine(BaseEngine):
             llm: BaseLLM = get_default_context().llm
         if embedding is None:
             embedding: BaseEmbedding = get_default_context().embedding
+        if rephraser is None:
+            rephraser = Rephraser(llm)
+        if retriever is None:
+            retriever = OpsmSplitRetriever(driver, embedding)
         self.driver: BaseDriver = driver
         self.llm: BaseLLM = llm
         self.embedding: BaseEmbedding = embedding
+        self.rephraser = rephraser
         self.retriever: BaseHtmlRetriever = retriever
         self.prompt_template: PromptTemplate = prompt_template.partial_format(
             driver_capability=driver.get_capability()
@@ -128,7 +156,8 @@ class NavigationEngine(BaseEngine):
         cls,
         context: Context,
         driver: BaseDriver,
-        retriever: BaseHtmlRetriever = OpsmSplitRetriever(),
+        rephraser: Rephraser = None,
+        retriever: BaseHtmlRetriever = None,
         prompt_template: PromptTemplate = NAVIGATION_ENGINE_PROMPT_TEMPLATE.prompt_template,
         extractor: BaseExtractor = NAVIGATION_ENGINE_PROMPT_TEMPLATE.extractor,
     ) -> "NavigationEngine":
@@ -139,6 +168,7 @@ class NavigationEngine(BaseEngine):
             driver,
             context.llm,
             context.embedding,
+            rephraser,
             retriever,
             prompt_template,
             extractor,
@@ -154,9 +184,7 @@ class NavigationEngine(BaseEngine):
         Return:
             `List[str]`: The nodes
         """
-        source_nodes = self.retriever.retrieve_html(
-            self.driver, self.embedding, QueryBundle(query_str=query)
-        )
+        source_nodes = self.retriever.retrieve_html(QueryBundle(query_str=query))
         source_nodes = [node.text for node in source_nodes]
         return source_nodes
 
@@ -172,44 +200,7 @@ class NavigationEngine(BaseEngine):
     def set_display(self, display: bool):
         self.display = display
 
-    def rephrase_query(self, query: str) -> List[dict]:
-        """
-        Rephrase the query
-        Args:
-            query (`str`): The query to rephrase
-        Return:
-            `List[dict]`: The rephrased query as a list of dictionaries
-        """
-        rephrase_prompt = REPHRASE_PROMPT.safe_substitute(instruction=query)
-        response = self.llm.complete(rephrase_prompt).text
-        response = response.strip("```json\n").strip("\n``` \n")
-        rephrased_query = extract_and_eval(response)
-        return rephrased_query
-
-    def _get_query_engine(self, streaming: bool = True) -> RetrieverQueryEngine:
-        """
-        Get the llama-index query engine
-        Args:
-            html: (`str`)
-            streaming (`bool`)
-        Return:
-            `RetrieverQueryEngine`
-        """
-
-        response_synthesizer = get_response_synthesizer(
-            streaming=streaming, llm=self.llm
-        )
-        query_engine = RetrieverQueryEngine(
-            retriever=self.retriever.to_llama_index(self.driver, self.embedding),
-            response_synthesizer=response_synthesizer,
-        )
-        query_engine.update_prompts(
-            {"response_synthesizer:text_qa_template": self.prompt_template}
-        )
-        return query_engine
-
     def get_action(self, query: str) -> Optional[str]:
-        # TODO: Rename query to instruction to be consistent with other engines
         """
         Generate the code from a query
         Args:
@@ -217,10 +208,9 @@ class NavigationEngine(BaseEngine):
         Return:
             `str`: The generated code
         """
-        query_engine = self._get_query_engine(streaming=False)
-        response = query_engine.query(query)
-        code = response.response
-        return self.extractor.extract(code)
+        nodes = self.get_nodes(query)
+        context = "\n".join(nodes)
+        return self.get_action_from_context(context, query)
 
     def execute_instruction_gradio(self, instruction: str, action_engine: Any):
         """
@@ -240,16 +230,17 @@ class NavigationEngine(BaseEngine):
         action_full = ""
         output = None
 
-        list_instructions = self.rephrase_query(instruction)
+        list_instructions = self.rephraser.rephrase_query(instruction)
         original_instruction = instruction
         action_nb = 0
         navigation_log_total = []
 
         for action in list_instructions:
+            logging_print.debug("query for retriever: " + action["query"])
             logging_print.debug("Rephrased instruction: " + action["action"])
             instruction = action["action"]
             start = time.time()
-            source_nodes = self.get_nodes(instruction)
+            source_nodes = self.get_nodes(action["query"])
             end = time.time()
             retrieval_time = end - start
 
@@ -369,7 +360,7 @@ class NavigationEngine(BaseEngine):
                     action_outcome["success"] = True
                     navigation_log["vision_data"] = vision_data
                 except Exception as e:
-                    print("Navigation error:", e)
+                    logging_print.error(f"Navigation error: {e}")
                     action_outcome["success"] = False
                     action_outcome["error"] = str(e)
 
@@ -431,14 +422,15 @@ class NavigationEngine(BaseEngine):
         success = False
         action_full = ""
 
-        list_instructions = self.rephrase_query(instruction)
+        list_instructions = self.rephraser.rephrase_query(instruction)
         original_instruction = instruction
         action_nb = 0
         navigation_log_total = []
 
         for action in list_instructions:
-            logging_print.debug("Rephrased instruction: " + action["action"])
             instruction = action["action"]
+            logging_print.debug("query for retriever: " + action["query"])
+            logging_print.debug("Rephrased instruction: " + action["action"])
             start = time.time()
             source_nodes = self.get_nodes(instruction)
             end = time.time()
@@ -492,7 +484,6 @@ class NavigationEngine(BaseEngine):
                         for item in vision_data:
                             display_screenshot(item["screenshot"])
                             time.sleep(0.2)
-
                     self.driver.exec_code(action)
                     time.sleep(self.time_between_actions)
                     if self.display:
@@ -507,7 +498,7 @@ class NavigationEngine(BaseEngine):
                     action_outcome["success"] = True
                     navigation_log["vision_data"] = vision_data
                 except Exception as e:
-                    print("Navigation error:", e)
+                    logging_print.error(f"Navigation error: {e}")
                     action_outcome["success"] = False
                     action_outcome["error"] = str(e)
 
@@ -557,29 +548,31 @@ class NavigationControl(BaseEngine):
         self.display = display
 
     def execute_instruction(self, instruction: str) -> ActionResult:
+        import inspect
+
+        code = ""
         logger = self.logger
-        display_page = False
 
         if "SCROLL_DOWN" in instruction:
-            code = self.driver.code_for_execute_script(
-                "window.scrollBy(0, window.innerHeight);"
-            )
+            self.driver.scroll_down()
+            code = inspect.getsource(self.driver.scroll_down)
         elif "SCROLL_UP" in instruction:
-            code = self.driver.code_for_execute_script(
-                "window.scrollBy(0, -window.innerHeight);"
-            )
+            self.driver.scroll_up()
+            code = inspect.getsource(self.driver.scroll_up)
         elif "WAIT" in instruction:
-            code = f"""
-import time
-time.sleep({self.time_between_actions})"""
+            self.driver.wait(self.time_between_actions)
+            code = inspect.getsource(self.driver.wait)
         elif "BACK" in instruction:
-            code = self.driver.code_for_back()
+            self.driver.back()
+            code = inspect.getsource(self.driver.back)
         elif "SCAN" in instruction:
-            code = ""
             self.driver.get_screenshots_whole_page()
+            code = inspect.getsource(self.driver.get_screenshots_whole_page)
+        elif "MAXIMIZE_WINDOW" in instruction:
+            self.driver.maximize_window()
+            code = inspect.getsource(self.driver.maximize_window)
         else:
             raise ValueError(f"Unknown instruction: {instruction}")
-        self.driver.exec_code(code)
         success = True
         if logger:
             log = {
